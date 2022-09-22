@@ -6,12 +6,17 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import android.Manifest;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -54,6 +59,8 @@ import com.google.ar.sceneform.ux.TransformableNode;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
@@ -65,6 +72,9 @@ import java.util.Map;
 import static androidx.core.content.PermissionChecker.PERMISSION_GRANTED;
 
 public class MainActivity extends AppCompatActivity {
+
+    private static final String TAG = "zgmn_MainActivity";
+
     private int REQUEST_CODE_PERMISSIONS=101;
     private String permissionList[]=new String[]{Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE};
     private Session mSession;
@@ -392,7 +402,12 @@ public class MainActivity extends AppCompatActivity {
             PixelCopy.request(view, bitmap, (copyResult) -> {
                 if (copyResult == PixelCopy.SUCCESS) {
                     try {
-                        saveBitmapToDisk(bitmap);
+                        long dateTaken = System.currentTimeMillis();
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            saveBitmapToDiskNewPolicy(bitmap, dateTaken);
+                        } else {
+                            saveBitmapToDisk(bitmap, dateTaken);
+                        }
                     } catch (IOException e) {
                         Toast toast = Toast.makeText(MainActivity.this, e.toString(),
                                 Toast.LENGTH_LONG);
@@ -441,8 +456,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     //saving the captured image in storage
-    private void saveBitmapToDisk(Bitmap bitmap) throws IOException {
-        File pictureFile = new File(getBatchDirectoryName(), new Date().toString() + ".jpeg");
+    private void saveBitmapToDisk(Bitmap bitmap, long dateTaken) throws IOException {
+        File pictureFile = new File(getBatchDirectoryName(), createJpegName(dateTaken) + ".jpeg");
         try {
             FileOutputStream oStream = new FileOutputStream(pictureFile);
             bitmap.compress(Bitmap.CompressFormat.JPEG, 100, oStream);
@@ -452,10 +467,54 @@ public class MainActivity extends AppCompatActivity {
             e.printStackTrace();
         }
     }
+
+    private void saveBitmapToDiskNewPolicy(Bitmap bitmap, long dateTaken) throws IOException {
+        String title = createJpegName(dateTaken);
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.ImageColumns.TITLE, title);
+        values.put(MediaStore.Images.ImageColumns.DISPLAY_NAME, title + ".jpg");
+        values.put(MediaStore.Images.Media.RELATIVE_PATH,
+                Environment.DIRECTORY_DCIM
+                        + File.separator
+                        + "Camera"
+                        + File.separator
+                        + "ARCamApp");
+        values.put(MediaStore.Images.ImageColumns.DATE_TAKEN, dateTaken);
+        values.put(MediaStore.Images.ImageColumns.ORIENTATION, 0);
+        values.put(MediaStore.Images.Media.IS_PENDING, 1);
+        values.put(MediaStore.Images.ImageColumns.MIME_TYPE, "image/jpeg");
+        values.put(MediaStore.MediaColumns.WIDTH, bitmap.getWidth());
+        values.put(MediaStore.MediaColumns.HEIGHT, bitmap.getHeight());
+        ContentResolver resolver = getContentResolver();
+        Uri uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+        try {
+            OutputStream os = resolver.openOutputStream(uri);
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 100, os);
+            os.close();
+            ContentValues publishValues = new ContentValues();
+            publishValues.put(MediaStore.Images.Media.IS_PENDING, 0);
+            resolver.update(uri, publishValues, null, null);
+            Log.i(TAG, "Image with uri: " + uri + " was published to the MediaStore");
+        } catch (Throwable th) {
+            // This can happen when the external volume is already mounted, but
+            // MediaScanner has not notify MediaProvider to add that volume.
+            // The picture is still safe and MediaScanner will find it and
+            // insert it into MediaProvider. The only problem is that the user
+            // cannot click the thumbnail to review the picture.
+            Log.e(TAG, "Failed to write Bitmap" + th);
+            if (uri != null) {
+                resolver.delete(uri, null, null);
+            }
+        }
+    }
+
     //make a new directory for this app's images and save clicked images there
     private String getBatchDirectoryName() {
-        String app_folder_path = Environment.getExternalStorageDirectory().toString()+"/ARCamApp";
-
+        String app_folder_path = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                + File.separator
+                + "Camera"
+                + File.separator
+                + "ARCamApp";
         File dir = new File(app_folder_path);
         if(!dir.exists())
             dir.mkdir();
@@ -477,6 +536,52 @@ public class MainActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if(ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)!=PERMISSION_GRANTED)
             Toast.makeText(this,"Please grant the required permission.",Toast.LENGTH_LONG).show();
+    }
+
+    private static ImageFileNamer sImageFileNamer;
+
+    public static String createJpegName(long dateTaken) {
+        if (null == sImageFileNamer) {
+            synchronized (MainActivity.class) {
+                if (null == sImageFileNamer) {
+                    sImageFileNamer = new ImageFileNamer("IMG_yyyyMMdd_HHmmss");
+                }
+            }
+        }
+        synchronized (sImageFileNamer) {
+            return sImageFileNamer.generateName(dateTaken);
+        }
+    }
+
+    private static class ImageFileNamer {
+        private final SimpleDateFormat mFormat;
+
+        // The date (in milliseconds) used to generate the last name.
+        private long mLastDate;
+
+        // Number of names generated for the same second.
+        private int mSameSecondCount;
+
+        public ImageFileNamer(String format) {
+            mFormat = new SimpleDateFormat(format);
+        }
+
+        public String generateName(long dateTaken) {
+            Date date = new Date(dateTaken);
+            String result = mFormat.format(date);
+
+            // If the last name was generated for the same second,
+            // we append _1, _2, etc to the name.
+            if (dateTaken / 1000 == mLastDate / 1000) {
+                mSameSecondCount++;
+                result += "_" + mSameSecondCount;
+            } else {
+                mLastDate = dateTaken;
+                mSameSecondCount = 0;
+            }
+
+            return result;
+        }
     }
 
 }
